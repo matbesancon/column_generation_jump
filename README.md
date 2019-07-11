@@ -1,5 +1,7 @@
 # A column generation example in Julia & JuMP
 
+[![DOI](https://zenodo.org/badge/130896714.svg)](https://zenodo.org/badge/latestdoi/130896714)
+
 Going through the cutting stock problem, we define the master
 and sub-problem and solve a linear relaxation with column generation,
 and then branch on the generated columns to find an integer solution.
@@ -8,6 +10,10 @@ and then branch on the generated columns to find an integer solution.
 
 All requirements are defined in the Project.toml, just activate and
 instantiate the project.
+
+## Citing
+
+See the DOI badge above or `CITING.bib`.
 
 ## Further reading
 
