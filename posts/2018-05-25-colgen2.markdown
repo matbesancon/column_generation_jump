@@ -1,0 +1,354 @@
++++
+date = 2018-05-30
+draft = false
+tags = ["julia", "optimization", "integer-optimization","jump"]
+title = "The cutting stock problem: part 2, solving with column generation"
+summary = """
+A column generation algorithm for the cutting width problem using Julia and JuMP
+"""
+math = true
+
+[header]
+image = "posts/cutting_stock/sushi_cuts.jpg"
++++
+
+--------
+
+In the [previous post]({{< relref "2018-05-23-colgen.markdown" >}}),
+we explored a well-known integer optimization situation
+in manufacturing, the cutting stock problem. After some details on the
+decisions, constraints and objectives, we implemented a naive model in JuMP.
+
+One key thing to notice is the explosion of number of variables and constraints
+and the fact that relaxed solutions (without constraining variables to be
+integers) are very far from actual feasible solutions.
+
+We will now use an other way of formulating the problem, using a problem
+decomposition and an associated solution method (column generation).
+
+## Re-stating the cutting stock problem
+
+Remember we used two decisions: $Y_i$ stating if the big roll $i$ is
+used and $X\_{ij}$ expressing the number of cuts $j$ made in the roll $i$.
+To minimize the number of rolls, it makes sense to put as many small cuts
+as possible on a big roll. We could therefore identify *saturating patterns*,
+that is, a combination of small cuts fitting on a big roll, such that no
+additional cut can be placed, and then find the smallest combination of the
+pattern satisfying the demand.
+
+One problem remains: it is impossible to compute, or even to store in memory all
+patterns, their number is exponentially big with the number of cuts, so we will
+try to find the best patterns and re-solve the problem, using the fact that not
+all possible patterns will be necessary.
+
+This is exactly what the Dantzig-Wolfe decomposition does, it splits the problem
+into a **Master Problem MP** and a **sub-problem SP**.
+
+* The Master Problem, provided a set of patterns, will find the best combination
+satisfying the demand.
+* The sub-problem, given an "importance" of each cut provided by the master
+problem, will find the best cuts to put on a new pattern.
+
+This is an iterative process, we can start with some naive patterns we can think
+of, compute an initial solution for the master problem, which will be feasible
+but not optimal, move on to the sub-problem to try to find a new pattern
+(or column in the optimization jargon, hence the term of column generation).
+
+How do we define the "importance" of a cut $j$? The value of the *dual variable*
+associated with this constraint will tell us that. This is not a lecture in
+duality theory, math-eager readers can check out further documentation on the
+cutting stock problem and duality in linear optimization.
+
+Moreover, we are going to add one element to our model: excess cuts can be sold
+at a price $P_j$, so that we can optimize by minimizing the net cost (production
+cost of the big rolls minus the revenue from excess cuts).
+
+## New formulation
+
+Again, we are going to formulate first possible decisions and
+then constraints on these decisions for the new version of the problem.
+
+### Decisions
+
+At the master problem level, given a pattern $p$, the decision will be
+$\theta_p$ (theta, yes Greek letters are awesome), the number of big rolls which
+will be used with this pattern. $\theta_p$ is a positive integer.
+
+The decision at the sub-problem level will be to find how many of each cut $j$
+to fit onto one big roll, $a_j$.
+
+For a pattern $p$, the number of times a cut $j$ appears is given by $a\_{jp}$.
+
+### Constraints
+
+The big roll size constraint is kept in the sub-problem, a pattern built
+has to respect this constraint:
+$$ \sum_j a\_{j} \cdot W_j \leq L $$
+
+
+The demand $D_j$ is met with all rolls of each pattern so it is kept at the master
+level. The number of cuts of type $j$ produced is the sum of the number of this
+cut on each patterns times the number of the pattern in a solution:
+
+$$ NumCuts_j = \sum_p a\_{jp} \cdot \theta_p \geq D_j$$
+
+### Objective formulation
+
+At the master problem, we minimize the number of rolls, which is simply:
+$$ \sum_{p} \theta_p $$
+
+At the sub-problem, we are trying to maximize the gain associated with the need
+for the demand + the residual price of the cuts. If we can find a worth using
+producing compared to its production cost, it is added.
+
+## Implementation
+
+As before, we will formulate the master and sub-problem using Julia with JuMP.
+Again, we use the Clp and Cbc open-source solvers.
+We read the problem data (prices, sizes, demand) from a JSON file.
+```
+using JuMP
+using Cbc: CbcSolver
+using Clp: ClpSolver
+import JSON
+
+const res = open("data0.json", "r") do f
+    data = readstring(f)
+    JSON.Parser.parse(data)
+end
+
+const maxwidth = res["maxwidth"]
+const cost = res["cost"]
+const prices = Float64.(res["prices"])
+const widths = Float64.(res["widths"])
+const demand = Float64.(res["demand"])
+const nwidths = length(prices)
+```
+
+`cost` is the production cost of a big roll.
+
+### Sub-problem
+
+The subproblem is a function taking reduced costs of each cut and maximizing
+the utility of the pattern it creates:
+
+{{< highlight julia >}}
+"""
+    subproblem tries to find the best feasible pattern
+    maximizing reduced cost and respecting max roll width
+    corresponding to a multiple-item knapsack
+"""
+function subproblem(reduced_costs, sizes, maxcapacity)
+    submodel = Model(solver = CbcSolver())
+    n = length(reduced_costs)
+    xs = @variable(submodel, xs[1:n] >= 0, Int)
+    @constraint(submodel, sum(xs. * sizes) <= maxcapacity)
+    @objective(submodel, Max, sum(xs. * reduced_costs))
+    solve(submodel)
+    return round.(Int,getvalue(xs)), round(Int,getobjectivevalue(submodel))
+end
+{{< /highlight >}}
+
+### Initial master problem
+
+We saw that the master problem finds a solution and then requires a new pattern
+from the sub-problem. This is therefore preferable to start from an initial
+feasible, otherwise we fall into a special case we're not discussing here.
+One initial solution would be to build one pattern per cut, with as many cuts as
+we can, which is $floor(L/w_j)$.
+
+{{< highlight julia>}}
+function init_master(maxwidth, widths, rollcost, demand, prices)
+    n = length(widths)
+    ncols = length(widths)
+    patterns = spzeros(UInt16,n,ncols)
+    for i in 1:n
+        patterns[i,i] = min(floor(Int,maxwidth/widths[i]),round(Int,demand[i]))
+    end
+    m = Model(solver = ClpSolver())
+    θ = @variable(m, θ[1:ncols] >= 0)
+    @objective(m, Min,
+        sum(θ[p] * (rollcost - sum(patterns[j,p] * prices[j] for j=1:n)) for p in 1:ncols)
+    )
+    @constraint(m, demand_satisfaction[j=1:n], sum(patterns[j,p] * θ[p] for p in 1:ncols)>=demand[j])
+    if solve(m) != :Optimal
+        warn("No optimal")
+    end
+    return (m, getvalue(θ), demand_satisfaction, patterns)
+end
+{{< /highlight >}}
+
+We can compute the reduced costs from the dual values associated with the
+demand and the prices of cuts
+
+{{< highlight julia>}}
+# getting the model and values
+(m, θ, demand_satisfaction, patterns) = init_master(maxwidth, widths, cost, demand, prices);
+
+# compute reduced costs
+reduced_costs = getdual(demand_satisfaction)+prices;
+
+# ask sub-problem for new pattern
+newcol, newobj = subproblem(reduced_costs, widths, maxwidth)
+{{< /highlight >}}
+
+### Putting it all together
+
+We can now build a column generation function putting all elements together and
+performing the main iteration:
+
+{{< highlight julia>}}
+function column_generation(maxwidth, widths, rollcost, demand, prices; maxcols = 5000)
+    (m, θ, demand_satisfaction, patterns) = init_master(maxwidth, widths, rollcost, demand, prices)
+    ncols = nwidths
+    while ncols <= maxcols
+        reduced_costs = getdual(demand_satisfaction) + prices
+        newcol, newobj = subproblem(reduced_costs, widths, maxwidth)
+        netcost = cost - sum(newcol[j] * (getdual(demand_satisfaction)[j]+prices[j]) for j in 1:nwidths)
+        println("New reduced cost: $netcost")
+        if netcost >= 0
+            return (:Optimal, patterns, getvalue(θ))
+        end
+        patterns = hcat(patterns, newcol)
+        ncols += 1
+        m = Model(solver = ClpSolver())
+        θ = @variable(m, θ[1:ncols] >= 0)
+        @objective(m, Min,
+            sum(θ[p] * (rollcost - sum(patterns[j,p] * prices[j] for j=1:nwidths)) for p in 1:ncols)
+        )
+        @constraint(m, demand_satisfaction[j=1:nwidths], sum(patterns[j,p] * θ[p] for p in 1:ncols)>=demand[j])
+        if solve(m) != :Optimal
+            warn("No optimal")
+            return (status(m), patterns, getvalue(θ))
+        end
+    end
+    return (:NotFound, patterns, :NoVariable)
+end
+{{< /highlight >}}
+
+We've printed information along the computation to see what's going on more
+clearly, now launching it:
+
+{{< highlight julia>}}
+status, patterns, θ = column_generation(maxwidth, widths, cost, demand, prices, maxcols = 500);
+New reduced cost: -443.18181818181824
+New reduced cost: -375.0
+New reduced cost: -264.0
+New reduced cost: -250.0
+New reduced cost: -187.5
+New reduced cost: -150.0
+New reduced cost: -150.0
+New reduced cost: -107.14285714285711
+New reduced cost: -97.5
+New reduced cost: -107.14285714285734
+New reduced cost: -72.0
+New reduced cost: -53.571428571428555
+New reduced cost: -53.125
+New reduced cost: -50.0
+New reduced cost: -43.40625
+New reduced cost: -36.0
+New reduced cost: -34.625
+New reduced cost: -41.5
+New reduced cost: -21.8515625
+New reduced cost: -22.159090909090878
+New reduced cost: -20.625
+New reduced cost: -16.304347826086314
+New reduced cost: -16.304347826086996
+New reduced cost: -20.310344827586277
+New reduced cost: -18.0
+New reduced cost: -8.837209302325732
+New reduced cost: -6.060606060606119
+New reduced cost: 0.0
+{{< /highlight >}}
+
+While the cost of a new pattern is negative, we can add it to the master and
+keep running. This seems to make sense. Now, one thing to note, we have not
+yet specified the **integrality** constraints, meaning that we don't have integer
+number of patterns. We can see that on the $\theta$ variable:
+{{< highlight julia>}}
+println(θ)
+[0.0, 0.0, 0.0, ... 70.0, 0.0, 0.0, 0.0, 12.56, 46.86, 0.0, 0.0, 0.0, 0.0,
+3.98, 0.0, 0.0, 21.5, 5.0, 31.12, 61.12, 33.58, 0.0, 0.0, 32.2, 44.0,
+46.88, 19.0, 1.88, 16.42]
+println(sum(θ))
+446.1000000000001
+{{< /highlight >}}
+
+We saw in the last post that the problem without integrality constraints is
+a relaxation and therefore, can only yield a better result. This means that we
+cannot have an integer solution using 446 big rolls or less, the minimum will
+be 447 rolls. Let's solve the problem with the same patterns, but adding the
+integrality:
+
+{{< highlight julia>}}
+# compute initial integer solution:
+# take worse case from linear solution, round up
+intial_integer = ceil.(Int,θ);
+
+
+"""
+    From patterns built in the column generation phase, find an integer solution
+"""function branched_model(patterns, demand, rollcost, prices; npatts = size(patterns)[2], initial_point = zeros(Int,npatts))
+    npatts = size(patterns)[2]
+    m = Model(solver = CbcSolver())
+    θ = @variable(m, θ[p = 1:npatts] >= 0, Int, start = initial_point[p])
+    @objective(m, Min,
+        sum(θ[p] * (rollcost - sum(patterns[j,p] * prices[j] for j=1:nwidths)) for p in 1:npatts)
+    )
+    @constraint(m, demand_satisfaction[j=1:nwidths], sum(θ[p] * patterns[j,p] for p in 1:npatts) >= demand[j])
+    status = solve(m)
+    return (status, round.(Int,(getvalue(θ))))
+end
+{{< /highlight >}}
+
+Let's see what the results look like:
+
+{{< highlight julia>}}
+status, θ_final = branched_model(patterns, demand, cost, prices; initial_point = intial_integer)
+println(status)
+:Optimal
+println(sum(θ_final))
+447
+{{< /highlight >}}
+
+Given that we cannot do better than 447, we know we have the optimal
+number of rolls.
+
+## Conclusion
+
+After seeing what a mess integer problems can be in the first part, we used a
+powerful technique called Dantzig-Wolfe decomposition, splitting the problem into
+master and sub-problem, each handling a subset of the constraints.
+
+Column generation is a technique making this decomposition usable in practice,
+by adding only one or few columns (patterns) at each iteration, we avoid
+an exponentially growing number of variables. The fact that JuMP is built as
+an embedded Domain Specific Language in Julia makes it a lot easier to specify
+problems and play around them. Most optimization specific modeling languages
+are built around declarative features and get messy very quickly when
+introducing some logic (like column generation iterations). Developers
+could relate this technique to lazy value computation: we know all values are
+there, but we just compute them whenever needed.
+
+Hope you enjoyed reading this second post on the cutting stock problem. A
+Jupyter notebook summing up all code snippets can be found at
+[this repository](https://github.com/matbesancon/column_generation_jump).
+Feel free to [ping me](http://twitter.com/matbesancon) for feedback!
+
+### Note on performance
+
+The column generation approach we just saw scales well to huge problems, but
+this particular implementation can feel a bit slow at first. One recommended
+thing is to do in such case is "warm-starting" the solver: give it a good
+initial solution to start from. Since we built both the master and subproblem
+as stateless functions, the model is being re-built from scratch each time.
+The advantage is that any solver can be used, since some of them don't support
+warm starts.  
+
+
+Thanks to Aristide for his very sharp ideas and views on this article which
+contributed to its improvement!
+
+
+--------
+Image source: https://www.flickr.com/photos/30478819@N08/38272827564

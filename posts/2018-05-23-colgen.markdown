@@ -1,0 +1,318 @@
++++
+date = 2018-05-23
+draft = false
+tags = ["julia", "modeling", "optimization", "integer-optimization","jump"]
+title = "Tackling the cutting stock problem: part 1, problem exploration"
+summary = """
+Solving a cutting stock problem step by step using Julia and JuMP
+"""
+math = true
+
+[header]
+image = "posts/cutting_stock/sushi_cuts.jpg"
++++
+
+Integer optimization often feels weird (at least to me). Simple reformulations
+of a (mixed) integer optimization problem (MIP) can make it way easier to solve.
+We're going to explore one well-known example of such integer problem in two
+blog posts. This first part introduces the problem and develops a naive solution.
+We're going to see why it's complex to solve and why this formulation does not
+scale.
+
+In a second post, we will see a reformulation of the problem which makes it
+easier to solve and scales to bigger instances.
+
+## Integer optimization reminder
+
+An optimization problem takes three components: decisions variables $x$, a set of
+constraints telling you if a decision is feasible or not and a cost function
+$c(x)$ giving a total cost of a decision. Optimization is a domain of applied
+mathematics consisting in finding the best feasible decision for a problem.
+Lots of decision problems come with *integrality constraints*: if $x$ is the
+decision, then it can only take integer values 0,1,2... or even only binary
+values ${0,1}$. Think of problems involving number of units produced
+for a good, yes/no decisions, etc... If a problem has lots of variables, naive
+enumerations of feasible solutions becomes impossible: even problems with 50
+variables can make your average laptop crash.
+
+## The cutting stock problem
+
+The problem is not new and has been given quite some thoughts because of its
+different industrial applications, it has been one of the first applications of
+the column generation method we are going to use. The key elements of the problems
+are: given some large rolls (metal, paper or other), we need to cut smaller
+portions of given lengths to satisfy a demand for the different small lengths.
+Find [more details here](https://en.wikipedia.org/wiki/Cutting_stock_problem).
+A small instance might be: given rolls of size $100cm$, we want to cut at least
+7 rolls of size $12cm$ and 9 rolls of size $29cm$. The objective is to minimize
+the number of big rolls to satisfy this demand.
+
+How do we formulate this mathematically?
+
+### Decisions
+$Y_i$ is a binary decision indicating if we use the big roll number $i$. $X\_{ij}$ is an integer
+giving the number of times we cut a small roll $j$ in the big roll $i$.
+
+### Constraints
+
+$Y$ are binary variables, $X$ are integer. Now the less trivial constraints:
+
+* **Demand satisfaction constraint**: the sum over all $i$ big rolls of the cut $j$
+has to satisfy the demand for that cut:
+$$\sum_{i} X\_{ij} \geq D_j $$
+
+For the two-cut example with the demand of $7 \times 12cm$ and $9 \times 29cm$,
+let's suppose we have 10 big rolls $i \in \{1...10\}$, the demand for the first
+12cm cut is 7 cuts, the number of cuts of this size produced is:
+$$ \sum_i X\_{i1} =  X\_{1,1} + X\_{2,1} + ... + X\_{10,1}$$
+
+This total must at least match the demand, so:
+$$ X\_{1,1} + X\_{2,1} + ... + X\_{10,1} \geq 7 $$
+
+* **Roll size constraint**: if a roll $i$ is used, we cannot fit more width
+onto it than its total width:
+$$\sum_{j} X\_{ij} \cdot W_j \leq L \cdot Y_i $$
+
+For the two-cut example with the demand of $7 \times 12cm$ and $9 \times 29cm$,
+let's suppose we have one roll $i$:
+
+* If $Y_i = 0$, the roll size constraint becomes:
+
+$$ \sum_{j} X\_{ij} \cdot W_j = 12 \cdot X\_{i1} + 29 \cdot X\_{i2} \leq 0 $$
+
+The only feasible solution for this roll $i$ is ($X\_{i1} = 0,X\_{i2} = 0$).
+
+* If $Y_i = 1$, the roll size constraint becomes:
+$$ 12 \cdot X\_{i1} + 29 \cdot X\_{i2} \leq 100 $$
+
+Which means we can fit as many cuts as the roll size allows for.
+
+## A first naive implementation
+
+Let's first import the necessary packages: we're using JuMP as a modeling
+tool, which is an optimization-specific language embedded in Julia
+(compare it to AMPL, GAMS, Pyomo, PuLP).
+As I consider it an embedded language, I'll do a full import into my namespace
+with `using` (unlike what I usually do with packages). We also use `Cbc`,
+an open-source solver for integer problems from the Coin-OR suite.
+
+{{< highlight julia >}}
+using JuMP
+using Cbc: CbcSolver
+{{< /highlight >}}
+
+We can define our optimization problem within a function taking the parameters
+of the cutting stock problem, namely a `maxwidth` of the big rolls, scalar
+assuming all of them have the same width, a `widths` vector, one element for
+each cut size $j$ and a `demand` vector, again, one for each cut size.
+
+{{< highlight julia >}}
+function cutting_stock_model(maxwidth, widths, demand, N = sum(demand))
+    # Define the JuMP model
+    m = Model(solver = CbcSolver())
+    # define the two groups of variables over their respective indices
+    Y = @variable(m, Y[1:N],Bin)
+    X = @variable(m, X[i=1:N,j=1:length(widths)],Int)
+    # define both constraints and objective
+    demand_satisfac = @constraint(m, [j=1:length(widths)],
+        sum(X[i,j] for i in 1:N) >= demand[j]
+    )
+    roll_size_const = @constraint(m, [i=1:N],
+        sum(X[i,j] * widths[j] for j in 1:length(widths)) <= Y[i] * maxwidth
+    )
+    @objective(m, Min, sum(Y[i] for i in 1:N))
+    # return the model formulation to solve later
+    return m
+end
+{{< /highlight >}}
+
+Here $N$ has to be an upper bound on the number of big rolls to use, otherwise
+the problem will be infeasible (not enough big rolls to find a solution
+satisfying the demand). An initial naive value for this could be the total
+demand, after all one small cut per roll can be considered a worst-case solution.
+
+Note that we don't call `solve` on the model yet, the function simply builds the
+model, this will help us see how it evolves with various entry parameters.
+In Julia REPL, or by using the `@show` macro, we can have more details on the
+model. Using `println(m)` instead of `@show` will build a mathematical
+formulation of the model in a LateX-like style, which can be valuable to
+ensure your implementation matches the initial formulation.
+
+{{< highlight julia >}}
+julia> println(cutting_stock_model(100, [12,10], [3,4]))
+Min Y[1] + Y[2] + Y[3] + Y[4] + Y[5] + Y[6] + Y[7]
+Subject to
+ X[1,1] + X[2,1] + X[3,1] + X[4,1] + X[5,1] + X[6,1] + X[7,1] ≥ 3
+ X[1,2] + X[2,2] + X[3,2] + X[4,2] + X[5,2] + X[6,2] + X[7,2] ≥ 4
+ 12 X[1,1] + 10 X[1,2] - 100 Y[1] ≤ 0
+ 12 X[2,1] + 10 X[2,2] - 100 Y[2] ≤ 0
+ 12 X[3,1] + 10 X[3,2] - 100 Y[3] ≤ 0
+ 12 X[4,1] + 10 X[4,2] - 100 Y[4] ≤ 0
+ 12 X[5,1] + 10 X[5,2] - 100 Y[5] ≤ 0
+ 12 X[6,1] + 10 X[6,2] - 100 Y[6] ≤ 0
+ 12 X[7,1] + 10 X[7,2] - 100 Y[7] ≤ 0
+ Y[i] ∈ {0,1} ∀ i ∈ {1,2,…,6,7}
+ X[i,j], integer, ∀ i ∈ {1,2,…,6,7}, j ∈ {1,2}
+{{< /highlight >}}
+
+Let's see what the model looks like for different instances:
+{{< highlight julia >}}
+julia> cutting_stock_model(100, [12,10], [85,97], 200)
+(Minimization problem with:
+ * 602 linear constraints
+ * 600 variables: 200 binary, 400 integer
+Solver is CbcMathProg,
+X[i,j], integer, ∀ i ∈ {1,2,…,199,200}, j ∈ {1,2},
+Y[i] ∈ {0,1} ∀ i ∈ {1,2,…,199,200})
+
+julia> cutting_stock_model(100, [12,10,25], [85,97,52], 300)
+(Minimization problem with:
+ * 1203 linear constraints
+ * 1200 variables: 300 binary, 900 integer
+Solver is CbcMathProg,
+X[i,j], integer,∀ i ∈ {1,2,…,299,300}, j ∈ {1,2,3},
+Y[i] ∈ {0,1} ∀ i ∈ {1,2,…,299,300})
+
+julia> cutting_stock_model(100, [12,10,25,40,30,41], [85,97,52,63,77,31], 500)
+(Minimization problem with:
+ * 3506 linear constraints
+ * 3500 variables: 500 binary, 3000 integer
+Solver is CbcMathProg,
+X[i,j], integer, ∀ i ∈ {1,2,…,499,500}, j ∈ {1,2,…,5,6},
+Y[i] ∈ {0,1} ∀ i ∈ {1,2,…,499,500})
+{{< /highlight >}}
+
+We see the number of variables and constraints explode as we add more possible
+cut sizes. More precisely:
+
+* Number of variables: $ size(X) + size(Y) = Nrolls \cdot Ncuts + Nrolls $
+* Number of constraints: $ size(DemandConstr) + size(WidthConstr) = Ncuts + Nrolls$
+
+Without going into details on the solving process, two things make the problem
+difficult to solve:
+
+1. Symmetry: if we place cuts on a roll $Y_1$ and leave another $Y_2$ unused,
+the resulting solution is concretely the same as using $Y_2$ and leaving $Y_1$
+unused.
+2. Bad relaxation: integer solvers mostly work by solving a "relaxed" version
+of the problem without the integrality constraint, and then iteratively
+restricting the problem to find the best integer solution. If the relaxed
+version of the problem yields solutions far away from an integer one, the solver
+will have more work to get there.
+
+Difficulty (1) is pretty intuitive, but we could get some insight on (2).
+Let's define our relaxed problem. We're going to use the `Clp` solver, which
+will solve the same problem, but without the `Int` restriction for $X$
+nor the `Bin` restriction for $Y$:
+{{< highlight julia >}}
+function relaxed_cutting_stock(maxwidth, widths, demand, N = sum(demand))
+   m = Model(solver = ClpSolver())
+   Y = @variable(m, 0 <= Y[1:N] <= 1)
+   X = @variable(m, X[1:N,1:length(widths)] >= 0)
+   demand_satisfac = @constraint(m, [j=1:length(widths)], sum(X[i,j] for i in 1:N) >= demand[j])
+   roll_size_const = @constraint(m, [i=1:N], sum(X[i,j] * widths[j] for j in 1:length(widths)) <= Y[i] * maxwidth)
+   @objective(m, Min, sum(Y[i] for i in 1:N))
+   return (m,Y,X)
+end
+{{< /highlight >}}
+
+Let's see the results:
+
+{{< highlight julia >}}
+julia> res = [(i,getvalue(Y[i])) for i in 1:N if getvalue(Y[i]) ≉ 0]
+33-element Array{Tuple{Int64,Float64},1}:
+ (1, 1.0)
+ (2, 1.0)
+ (3, 1.0)
+ (4, 1.0)
+ (5, 1.0)
+ (6, 1.0)
+ (7, 1.0)
+ (8, 1.0)
+ (9, 1.0)
+ (10, 1.0)
+ (11, 1.0)
+ (12, 1.0)
+ (13, 1.0)
+ (14, 1.0)
+ (15, 1.0)
+ (16, 1.0)
+ (17, 1.0)
+ (18, 1.0)
+ (19, 1.0)
+ (20, 1.0)
+ (21, 1.0)
+ (22, 1.0)
+ (23, 1.0)
+ (24, 1.0)
+ (25, 1.0)
+ (26, 1.0)
+ (27, 1.0)
+ (28, 1.0)
+ (29, 1.0)
+ (30, 1.0)
+ (31, 1.0)
+ (32, 0.9)
+ (84, 1.0)
+
+idxs = [i for (i,_ ) in res]
+julia> [getvalue(X)[i,:] for i in idxs]
+33-element Array{Array{Float64,1},1}:
+ [0.0, 7.0, 1.2]
+ [0.0, 0.0, 4.0]
+ [0.0, 0.0, 4.0]
+ [0.0, 0.0, 4.0]
+ [0.0, 0.0, 4.0]
+ [0.0, 0.0, 4.0]
+ [0.0, 0.0, 4.0]
+ [0.0, 0.0, 4.0]
+ [0.0, 0.0, 4.0]
+ [0.0, 10.0, 0.0]
+ [0.0, 10.0, 0.0]
+ [0.0, 0.0, 4.0]
+ [0.0, 10.0, 0.0]
+ [0.0, 10.0, 0.0]
+ [0.0, 10.0, 0.0]
+ [0.0, 10.0, 0.0]
+ [0.0, 10.0, 0.0]
+ [0.0, 10.0, 0.0]
+ [0.0, 10.0, 0.0]
+ [0.0, 0.0, 4.0]
+ [0.0, 0.0, 4.0]
+ [0.0, 0.0, 4.0]
+ [8.0, 0.0, 0.16]
+ [8.0, 0.0, 0.16]
+ [8.0, 0.0, 0.16]
+ [8.0, 0.0, 0.16]
+ [8.0, 0.0, 0.16]
+ [8.0, 0.0, 0.16]
+ [8.0, 0.0, 0.16]
+ [8.0, 0.0, 0.16]
+ [5.8, 0.0, 1.216]
+ [7.2, 0.0, 0.144]
+ [8.0, 0.0, 0.16]
+{{< /highlight >}}
+
+We notice the $Y$ variables are overall pretty saturated and almost integer,
+but the $X$ variables are highly fractional: the linear cuts are divided such
+that they fit perfectly the big rolls. This will make the variable hard to
+get to an integer solution.
+
+## Conclusion
+
+This was a quick intro to the cutting stock problem to get a grasp of its
+structure and difficulty, the goal was not to get too technical and keep a
+broad target audience.
+
+Hope you enjoyed it, if that's the case, I'll see you on the next article,
+we'll implement a *column generation* algorithm from scratch to solve it.
+If you have any question/remarks, feel free to [get in touch](http://twitter.com/matbesancon/).
+
+## Thanks
+
+Special thanks to [Soham](https://github.com/SohamTamba) and Aristide
+for their feedback, these helped me a great deal simplify the structure and add
+details and explanations where needed.
+
+--------
+Image source: https://www.flickr.com/photos/30478819@N08/38272827564
