@@ -6,11 +6,8 @@ and then branch on the generated columns to find an integer solution.
 
 ## Requirements
 
-Running the column generation notebook just requires JSON, JuMP, Clp and Cbc.
-You can easily replace these with any LP + MILP solver.  
-
-To generate random instances of the problem, you can change the seed in the 
-*build_data.ipynb* notebook and save the resulting problem to `data.json`.
+All requirements are defined in the Project.toml, just activate and
+instantiate the project.
 
 ## Further reading
 
